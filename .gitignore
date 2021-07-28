@@ -1,3 +1,4 @@
-nlp_adversarial_examples/*
+.vscode/
+nlp_adversarial_examples/
 tsp/solution/*
 tsp/cnt_pkl/*
