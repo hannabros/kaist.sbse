@@ -1,5 +1,14 @@
 .vscode/
 nlp_adversarial_examples/
+SememePSO-Attack/
+mecab-0.996-ko-0.9.2/
+mecab-ko-dic-2.1.1-20180720/
+wandb/
 tsp/solution/*
 tsp/cnt_pkl/*
 proj/data/*.txt
+*.pyc
+*.bin
+*.pkl
+*.pt
+

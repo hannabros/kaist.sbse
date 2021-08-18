@@ -1,230 +1,137 @@
 import os, sys
 import logging
 import argparse
-import csv
-import gc
-from tqdm import tqdm
-from collections import OrderedDict
 
-from sklearn.model_selection import train_test_split
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch import nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import gluonnlp as nlp
+import numpy as np
+from tqdm import tqdm
 
-from transformers import BertTokenizer, BertModel
-from transformers import AdamW, get_linear_schedule_with_warmup
+from kobert.utils import get_tokenizer
+from kobert.pytorch_kobert import get_pytorch_kobert_model
+
+from transformers import AdamW
+from transformers.optimization import get_cosine_schedule_with_warmup
 from transformers import WEIGHTS_NAME, CONFIG_NAME
 
-from CustomDataset import MovieDataset
-from CustomModel import SentimentBertModel
+from CustomDataset import BERTDataset
+from CustomModel import BERTClassifier
 from util.log import setup_default_logging
-from util.metrics import AverageMeter
-from util.collate import customCollate
-
-try:
-    import wandb
-    has_wandb = True
-except ImportError: 
-    has_wandb = False
 
 _logger = logging.getLogger('train')
 parser = argparse.ArgumentParser(description='Train Config', add_help=False)
 
-def get_dataset(data_path, tokenizer, max_len, random_seed, is_train=True):
-    document, target = [], []
-    with open(data_path, 'r'):
-        lines = csv.reader()
-        header = lines.pop(0)
-        for line in lines:
-            line = line.split('\t')
-            document.append(line[1])
-            target.append(line[2])
-    if is_train:
-        train_doc, valid_doc, train_target, valid_target = train_test_split(
-            document, target, test_size=0.2, shuffle=True, stratify=target, random_state=random_seed
-        )
-        train_dataset = MovieDataset(tokenizer, train_doc, train_target, max_len)
-        valid_dataset = MovieDataset(tokenizer, valid_doc, valid_target, max_len)
-        return train_dataset, valid_dataset
-    else:
-        test_dataset = MovieDataset(tokenizer, document, target, max_len)
-        return test_dataset
+def calc_accuracy(X,Y):
+    max_vals, max_indices = torch.max(X, 1)
+    train_acc = (max_indices == Y).sum().data.cpu().numpy()/max_indices.size()[0]
+    return train_acc
 
-def initalize_model(prev_model, max_len, finetune=False):
-    model = BertModel.from_pretrained(prev_model)
-    model = SentimentBertModel.from_pretrained(prev_model, 
-                                                n_classes=2,
-                                                max_length=max_len)
-    if finetune:
-        for param in model.parameters():
-            param.requires_grad = True
-    else:
-        for name, param in model.named_parameters():
-            if 'classifier' in name:
-                param.requires_grad = True
-
-    return model
-
-def train_one_epoch(model, loader, device, loss_fn, optimizer):
-    ### argument
-    log_interval = None
-    ###
-
-    model.train()
-    
-    train_loss_m = AverageMeter()
-    last_idx = len(loader) - 1
-    for idx, batch in tqdm(enumerate(loader), total=len(loader)):
-        last_batch = idx == last_idx
-        optimizer.zero_grad()    
-        batch = {k: v.to(device) for k, v in batch.items()}
-        logits = model(input_ids=batch['input_ids'],
-                        token_type_ids=batch['token_type_ids'],
-                        attention_mask=batch['attention_mask'])
-
-        loss, _ = loss_fn(logits, batch['label'])
-        train_loss_m.update(loss.data.item(), batch['input_ids'].size(0))
-
-        loss.backward()
-        optimizer.step()
-
-        if last_batch or (idx+1 % log_interval == 0):
-            lrl = [param_group['lr'] for param_group in optimizer.param_groups]
-            avg_lr = sum(lrl)/len(lrl)
-            _logger.info(
-                f'avg_train_loss : {train_loss_m.avg}, LR : {avg_lr}')
-
-        del batch, loss
-
-    del loader
-    gc.collect()
-
-    metrics = OrderedDict([('loss', train_loss_m.avg)])
-
-    return metrics
-        
-def validation(model, loader, device, loss_fn):
-    ### argument
-    log_interval = None
-    ###
-
-    model.eval()
-    val_loss_m = AverageMeter()
-    acc_m = AverageMeter()
-
-    last_idx = len(loader) - 1
-    with torch.no_grad():
-        for idx, batch in enumerate(loader):
-            last_batch = idx == last_idx
-            batch = {k: v.to(device) for k, v in batch.items()}
-            logits = model(input_ids=batch['input_ids'],
-                                 token_type_ids=batch['token_type_ids'],
-                                 attention_mask=batch['attention_mask'])
-            
-            loss, scores = loss_fn(logits, batch['label'])
-            val_loss_m.update(loss.data.item(), batch['input_ids'].size(0))
-            
-            acc = sum([i == j for i, j in zip(torch.argmax(scores, 1).tolist(), batch['label'])]) / len(batch['label'])
-            acc_m.update(acc)
-            val_loss_m.update(loss, batch['input_ids'].size(0))
-
-            del batch, loss, scores            
-
-        if last_batch or (idx+1 % log_interval == 0):
-            _logger.info(
-                f'avg_val_loss : {val_loss_m.avg}, avg_accuracy : {acc_m.avg}')
-
-    metrics = OrderedDict([('loss', val_loss_m.avg), ('accuracy', acc_m.avg)])
-
-    del loader
-    gc.collect()
-
-    return metrics
-
-def save(model, tokenizer, args):
+def save(model, e, optimizer, loss, model_path):
     _logger.info('saving model...')
-    os.makedirs(args.new_model, exist_ok=True)
-    torch.save(model.state_dict(), args.new_model + WEIGHTS_NAME)
-    model.config.to_json_file(args.new_model + CONFIG_NAME)
-    tokenizer.save_pretrained(args.new_model)
-    _logger.info(f'saved! {args.new_model}')
+    os.makedirs(model_path, exist_ok=True)
+    torch.save({
+            'epoch': e,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': loss
+            }, model_path + WEIGHTS_NAME)
+    _logger.info(f'saved! {model_path}')
 
 def main():
     ### argument
-    random_seed = None
-    prev_model = None
-    train_data_path = None
-    test_data_path = None
-    max_len = 512
-    batch_size = None
-    lr = None
-    epochs = None
-    valid_every_n_batch = None
-    save_best = None
-    val_metric = None
+    train_data_path = "/home/ubuntu/workspace/kaist.sbse/proj/data/ratings_train.txt"
+    test_data_path = "/home/ubuntu/workspace/kaist.sbse/proj/data/ratings_train.txt"
+    save_model_path = "./model/"
+    
+    ## Setting parameters
+    max_len = 64
+    batch_size = 64
+    warmup_ratio = 0.1
+    num_epochs = 5
+    max_grad_norm = 1
+    log_interval = 200
+    learning_rate =  5e-5
     ###
 
-    setup_default_logging()
     if torch.cuda.is_available():
         device = torch.device("cuda")
         _logger.info(f'GPU: {torch.cuda.get_device_name(0)}')
     else:
         device = torch.device("cpu")
-    torch.manual_seed(random_seed)
 
-    tokenizer = BertTokenizer.from_pretrained(prev_model, do_lower_case=False)
-    train_dataset, valid_dataset = get_dataset(train_data_path, tokenizer, max_len, random_seed, is_train=True)
+    bertmodel, vocab = get_pytorch_kobert_model()
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=customCollate)
-    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, collate_fn=customCollate)
+    dataset_train = nlp.data.TSVDataset(train_data_path, field_indices=[1,2], num_discard_samples=1)
+    dataset_test = nlp.data.TSVDataset(test_data_path, field_indices=[1,2], num_discard_samples=1)
 
-    model = initalize_model(prev_model, max_len)
-    model = model.to(device)
+    tokenizer = get_tokenizer()
+    tok = nlp.data.BERTSPTokenizer(tokenizer, vocab, lower=False)
+    
+    data_train = BERTDataset(dataset_train, 0, 1, tok, max_len, True, False)
+    data_test = BERTDataset(dataset_test, 0, 1, tok, max_len, True, False)
 
-    total_steps = len(train_loader) * epochs
-    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=2, num_training_steps=total_steps)
-    loss_fn = nn.CrossEntrophy()
+    train_dataloader = torch.utils.data.DataLoader(data_train, batch_size=batch_size, num_workers=1)
+    test_dataloader = torch.utils.data.DataLoader(data_test, batch_size=batch_size, num_workers=1)
 
-    min_val_loss = 10.0
-    max_accuracy = 0.0
-    try:
-        for epoch in range(epochs):
-            gc.collect()
-            _logger.info(f'Train {epoch} epoch')
-            train_metrics = train_one_epoch(model, train_loader, device, optimizer)
+    model = BERTClassifier(bertmodel,  dr_rate=0.5).to(device)
 
-            gc.collect()
+    # Prepare optimizer and schedule (linear warmup and decay)
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    ]
 
-            if (epoch + 1) % valid_every_n_batch == 0:
-                _logger.info('validation ...')
-                valid_metrics = validation(model, valid_loader, device)
-                scheduler.step()
+    optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate)
+    loss_fn = nn.CrossEntropyLoss()
 
-                gc.collect()
+    t_total = len(train_dataloader) * num_epochs
+    warmup_step = int(t_total * warmup_ratio)
 
-                # Save / Early Stop
-                if save_best.lower().startswith('loss'):
-                    _logger.info(f'best loss was {min_val_loss}')
-                    if valid_metrics[val_metric] < min_val_loss:
-                        min_val_loss = valid_metrics[val_metric]
-                        _logger.info(f'best loss changed to {min_val_loss}')
-                        save(model, tokenizer)
-                elif save_best.lower().startswith('accuracy'):
-                    _logger.info(f'best accuracy was {max_accuracy}')                    
-                    if valid_metrics[val_metric] > max_accuracy:
-                        max_accuracy = valid_metrics[val_metric]
-                        _logger.info(f'best accuracy changed to {min_val_loss}')
-                        save(model, tokenizer)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_step, num_training_steps=t_total)
 
-    except KeyboardInterrupt:
-        if save_best.lower().startswith('accuracy'):
-            _logger.info(f'Model accuracy was {max_accuracy}')
-        elif save_best.lower().startswith('loss'):
-            _logger.info(f'Model valid loss was {min_val_loss}')
-        elif save_best.lower().startswith('weight'):
-            _logger.info(f'Model weighted valid loss was {min_val_loss}')
-        _logger.info('Bye!')
+    for e in range(num_epochs):
+        train_acc = 0.0
+        test_acc = 0.0
+        best_acc = 0.0
+        model.train()
+        for batch_id, (token_ids, valid_length, segment_ids, label) in enumerate(tqdm(train_dataloader)):
+            optimizer.zero_grad()
+            token_ids = token_ids.long().to(device)
+            segment_ids = segment_ids.long().to(device)
+            valid_length= valid_length
+            label = label.long().to(device)
+            out = model(token_ids, valid_length, segment_ids)
+            loss = loss_fn(out, label)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            scheduler.step()  # Update learning rate schedule
+            train_acc += calc_accuracy(out, label)
+            if batch_id % log_interval == 0:
+                _logger.info("epoch {} batch id {} loss {} train acc {}".format(e+1, batch_id+1, loss.data.cpu().numpy(), train_acc / (batch_id+1)))
+        _logger.info("epoch {} train acc {}".format(e+1, train_acc / (batch_id+1)))
+        
+        model.eval()
+        for batch_id, (token_ids, valid_length, segment_ids, label) in enumerate(tqdm(test_dataloader)):
+            token_ids = token_ids.long().to(device)
+            segment_ids = segment_ids.long().to(device)
+            valid_length= valid_length
+            label = label.long().to(device)
+            out = model(token_ids, valid_length, segment_ids)
+            test_acc += calc_accuracy(out, label)
+        _logger.info("epoch {} test acc {}".format(e+1, test_acc / (batch_id+1)))
+
+        if test_acc > best_acc:
+            _logger.info(f'best accuracy was {best_acc}')
+            best_acc = test_acc
+            _logger.info(f'best accuracy changed to {best_acc}')
+            save(model, e, optimizer, loss, save_model_path)
 
 if __name__ == "__main__":
+    setup_default_logging()
     main()
