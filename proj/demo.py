@@ -1,5 +1,6 @@
 
 import os, sys
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import fasttext
 import csv
 import MeCab
@@ -11,6 +12,7 @@ import logging
 random.seed(1234)
 
 import torch
+from sentence_transformers import SentenceTransformer, util
 import gluonnlp as nlp
 from kobert.utils import get_tokenizer
 from kobert.pytorch_kobert import get_pytorch_kobert_model
@@ -24,17 +26,18 @@ from attacks import GreedyAttack, GeneticAttack, PSOAttack, PerturbBaseline
 _logger = logging.getLogger('train')
 
 def save(result, result_path, algorithm, pop_size, sample_size):
-    file_name = os.path.join(result_path, f'{algorithm}_p{pop_size}_s{sample_size}2.pkl')
+    file_name = os.path.join(result_path, f'{algorithm}_p{pop_size}_s{sample_size}_4.pkl')
     with open(file_name, 'wb') as f:
         pickle.dump(result, f)
-    _logger.info(f'saved to {file_name}')
+    print(f'saved to {file_name}')
+    # _logger.info(f'saved to {file_name}')
 
 def main(algorithm):
     ### argument
     data_path = './data/rating_test_spell.pkl'
     result_path = './result/'
     pop_size = 50
-    max_iters = 50
+    max_iters = 20
     sample_size = 100
     ###
 
@@ -44,12 +47,15 @@ def main(algorithm):
         d = pickle.load(f)
         spell_documents = d['documents']
         targets = d['targets']
-        target_scores = d['target_scores']
+        scores = d['scores']
     _logger.info(f'finished loading {len(spell_documents)} data')
 
     _logger.info('loading embedding model')
     # load embedding model
-    embedding_model = fasttext.load_model('/home/ubuntu/workspace/kaist.sbse/proj/data/cc.ko.300.bin')
+    embedding_model = fasttext.load_model('/home/ubuntu/workspace/kaist.sbse/proj/data/cc.ko.100.bin')
+
+    # load sentence model
+    sent_model = SentenceTransformer("Huffon/sentence-klue-roberta-base")
 
     _logger.info('loading tagger')
     # load Mecab
@@ -72,41 +78,59 @@ def main(algorithm):
 
     _logger.info('filtering test data')
     # filter and make test_set
-    test_set = [(d, t) for d, t in zip(spell_documents, targets) if len(d.split()) >= 5 and len(d.split()) < 30]
-    test_set = random.sample(test_set, sample_size)
+    test = []
+    for d, t, s in zip(spell_documents, targets, scores):
+        if float(s[t]) > 0.5:
+            test.append((d, t))
+    f_test = [t for t in test if len(t[0].split()) > 3]
+    test_set = random.sample(f_test, sample_size)
 
     result = []
     if algorithm == 'greedy':
-        attack = GreedyAttack(pop_size=pop_size, max_iters=max_iters, embedding_model=embedding_model, sa_model=sa_model, tokenizer=tok, tagger=tagger)
+        attack = GreedyAttack(pop_size=pop_size, max_iters=max_iters, embedding_model=embedding_model, sent_model=sent_model, sa_model=sa_model, tokenizer=tok, tagger=tagger)
     elif algorithm == 'genetic':
-        attack = GeneticAttack(pop_size=pop_size, max_iters=max_iters, embedding_model=embedding_model, sa_model=sa_model, tokenizer=tok, tagger=tagger)
+        attack = GeneticAttack(pop_size=pop_size, max_iters=max_iters, embedding_model=embedding_model, sent_model=sent_model, sa_model=sa_model, tokenizer=tok, tagger=tagger)
     elif algorithm == 'pso':
-        attack = PSOAttack(pop_size=pop_size, max_iters=max_iters, embedding_model=embedding_model, sa_model=sa_model, tokenizer=tok, tagger=tagger)
+        # max_iters = 5
+        attack = PSOAttack(pop_size=pop_size, max_iters=max_iters, embedding_model=embedding_model, sent_model=sent_model, sa_model=sa_model, tokenizer=tok, tagger=tagger)
     elif algorithm == 'base':
-        attack = PerturbBaseline(pop_size=pop_size, max_iters=max_iters, embedding_model=embedding_model, sa_model=sa_model, tokenizer=tok, tagger=tagger)
+        attack = PerturbBaseline(pop_size=pop_size, max_iters=max_iters, embedding_model=embedding_model, sent_model=sent_model, sa_model=sa_model, tokenizer=tok, tagger=tagger)
     
     cnt = 0
     error_idx = []
-    for i, t in enumerate(tqdm(test_set[10:])):
-        try:
-            x_orig = t[0]
-            adv_target = 0 if t[1] == 1 else 1
-            adv_result = attack.attack(x_orig, adv_target)
-            if adv_result is not None:
-                x_adv = adv_result[0]
-                adv_score = adv_result[1]
-                changes = adv_result[2]
-                result.append((x_orig, x_adv.text, adv_score, changes))
-                cnt += 1
-                save(result, result_path, algorithm, pop_size, sample_size)
-                _logger.info(f'succeeded {cnt}')
-        except:
-            error_idx.append(i)
+    for i, t in enumerate(tqdm(test_set)): # 57 제외
+        x_orig = t[0]
+        adv_target = 0 if t[1] == 1 else 1
+        adv_result = attack.attack(x_orig, adv_target)
+        if adv_result is not None:
+            x_adv = adv_result[0]
+            adv_score = adv_result[1]
+            changes = adv_result[2]
+            result.append((x_orig, x_adv.text, adv_score, changes))
+            cnt += 1
+            save(result, result_path, algorithm, pop_size, sample_size)
+            print(f'succeeded {cnt}')
+        # try:
+        #     x_orig = t[0]
+        #     adv_target = 0 if t[1] == 1 else 1
+        #     adv_result = attack.attack(x_orig, adv_target)
+        #     if adv_result is not None:
+        #         x_adv = adv_result[0]
+        #         adv_score = adv_result[1]
+        #         changes = adv_result[2]
+        #         result.append((x_orig, x_adv.text, adv_score, changes))
+        #         cnt += 1
+        #         save(result, result_path, algorithm, pop_size, sample_size)
+        #         print(f'succeeded {cnt}')
+        #         # _logger.info(f'succeeded {cnt}')
+        # except Exception as e:
+        #     print(e)
+        #     error_idx.append(i)
     
     return result, error_idx
 
 if __name__ == "__main__":
-    setup_default_logging()
+    #setup_default_logging()
 
     algs = ['greedy', 'genetic', 'pso', 'base']
     alg = sys.argv[1]
